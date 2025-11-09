@@ -20,7 +20,7 @@ def load_all_models():
 # Streamlit Page Setup
 # --------------------------------------
 st.set_page_config(
-    page_title="Smart Image Classifier",
+    page_title="CortexVault - By Team Zenith",
     page_icon="🤖",
     layout="wide"
 )
@@ -29,7 +29,7 @@ st.set_page_config(
 # Title + Description
 # --------------------------------------
 st.markdown("""
-## 🤖 Smart Image Classifier & Organizer
+## 🤖 CortexVault - By Team Zenith
 Upload images and let **YOLOv8** detect objects while **EfficientNetV2-M** classifies them.
 The app intelligently groups your images into hierarchical folders.
 """)
