@@ -2,225 +2,272 @@ import streamlit as st
 import tempfile
 import os
 import shutil
+import csv
 import time
-import json
-import cv2
-from pathlib import Path
+import numpy as np
+import re
+from organizer_backend import load_models, analyze_image
 
-from organizer_backend import analyze_path, save_item, ORGANIZED_ROOT, ingest_json_batch
+# --------------------------------------
+# Cache models (so they load only once)
+# --------------------------------------
+@st.cache_resource
+def load_all_models():
+    return load_models()
 
-# --------------------------------------------------------------
-# Streamlit Page Setup
-# --------------------------------------------------------------
-st.set_page_config(page_title="CortexVault — Clean UI", page_icon="🗂️", layout="wide")
+# --------------------------------------
+# UI
+# --------------------------------------
+st.set_page_config(page_title="Auraverse — Smart Organizer", layout="wide", initial_sidebar_state="expanded")
+st.title("Auraverse — Intelligent Multi-Modal Storage System")
+st.caption("Upload images and let the system classify and organize them into Main / Sub / Specific ...")
 
-st.markdown("# CortexVault — Clean, Stable Streamlit UI")
-st.write("Upload images, videos, documents, or paste ANY JSON (object / array / multi-collection).\n")
-st.write("---")
+# --------------------------------------
+# Sidebar options
+# --------------------------------------
+st.sidebar.header("Settings")
+save_root = st.sidebar.text_input("Save root folder", value=os.path.join(os.getcwd(), "organized"))
+os.makedirs(save_root, exist_ok=True)
 
-# --------------------------------------------------------------
-# Sidebar
-# --------------------------------------------------------------
-with st.sidebar:
-    st.header("Settings")
-    st.code(f"Backend Root: {ORGANIZED_ROOT}")
-    show_thumbnails = st.checkbox("Show video thumbnails", True)
-    show_doc_snippet = st.checkbox("Show document preview", True)
+log_csv = st.sidebar.checkbox("Log CSV (save a mapping log)", value=True)
+csv_path = os.path.join(save_root, "mapping_log.csv")
+if log_csv and not os.path.exists(csv_path):
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "filename", "detected_objects", "mapped_categories"])
 
-# --------------------------------------------------------------
-# Upload Files
-# --------------------------------------------------------------
-st.subheader("Upload Files")
-uploaded_files = st.file_uploader("Select files", accept_multiple_files=True)
+# New option: whether to show manual gender resolution for ambiguous humans
+show_gender_resolve = st.sidebar.checkbox("Enable manual gender-resolve for ambiguous humans", value=True)
 
-# --------------------------------------------------------------
-# JSON Input
-# --------------------------------------------------------------
-st.subheader("Or Paste Any JSON (Object, Array, Multi-Collection)")
-json_text = st.text_area("Paste JSON here", height=200)
-json_batch_parsed = None
-json_batch_info = None
+# --------------------------------------
+# Load Models
+# --------------------------------------
+yolo_model, clf_model, preprocess, labels = load_all_models()
 
-# Temp folder for uploads
-TMP_BASE = Path(tempfile.gettempdir()) / "cortexvault_tmp"
-TMP_BASE.mkdir(parents=True, exist_ok=True)
+# --------------------------------------
+# helper: safe_name (used earlier when needed)
+# --------------------------------------
+def safe_name(name: str, max_len: int = 128) -> str:
+    name = name.strip()
+    name = re.sub(r'[\\/:"*?<>|]+', '', name)
+    name = re.sub(r'\s+', '_', name)
+    return name[:max_len] if len(name) > max_len else name
 
-processed = []
+# --------------------------------------
+# File Upload Section
+# --------------------------------------
+st.markdown("### 📤 Upload Images")
+uploaded_files = st.file_uploader(
+    "Select one or more image files", type=["jpg", "jpeg", "png", "bmp", "webp"], accept_multiple_files=True
+)
 
-# --------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------
-def save_to_tmp(uploaded_file):
-    fname = uploaded_file.name
-    uid = str(int(time.time() * 1000))
-    d = TMP_BASE / f"u_{uid}"
-    d.mkdir(exist_ok=True)
-    p = d / fname
-    with open(p, "wb") as f:
-        f.write(uploaded_file.read())
-    return str(p)
-
-
-def extract_frame(video_path):
-    try:
-        cap = cv2.VideoCapture(video_path)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total // 2))
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            return None
-        out = str(TMP_BASE / f"thumb_{int(time.time()*1000)}.jpg")
-        cv2.imwrite(out, frame)
-        return out
-    except Exception:
-        return None
-
-# --------------------------------------------------------------
-# Process Uploaded Files
-# --------------------------------------------------------------
 if uploaded_files:
     cols = st.columns(2)
+    columns = cols
+    image_display_width = 360
 
-    for i, up in enumerate(uploaded_files):
-        tmp_path = save_to_tmp(up)
-        info = analyze_path(tmp_path)
-        col = cols[i % 2]
+    processed_data = []
 
-        with col:
-            st.markdown(f"### {up.name}")
-            kind = info.get("type")
-            suggested = info.get("suggested_folder", "Documents/other")
+    for i, uploaded_file in enumerate(uploaded_files):
+        # save uploaded to a temporary path to pass to YOLO and to copy later
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
 
-            # Images
-            if kind == "image":
-                st.image(tmp_path, use_container_width=True)
-                override = st.text_input("Folder", suggested, key=f"ov{i}")
+        # analyze
+        detected_labels, mapped_categories, annotated_img = analyze_image(tmp_path, yolo_model, clf_model, preprocess, labels)
 
-            # Videos
-            elif kind == "video":
-                if show_thumbnails:
-                    th = extract_frame(tmp_path)
-                    if th:
-                        st.image(th, caption="thumbnail", use_container_width=True)
-                override = st.text_input("Folder", suggested, key=f"ov{i}")
+        # show preview
+        display_img = annotated_img
+        col = columns[i % 2]
+        with col.container():
+            st.image(display_img, caption=f"🖼️ {uploaded_file.name}", width=image_display_width)
 
-            # Documents
-            elif kind == "document":
-                snippet = info.get("snippet", "")
-                if show_doc_snippet:
-                    st.text_area("Preview", snippet[:600], height=140, key=f"pv{i}")
-                override = st.text_input("Folder", suggested, key=f"ov{i}")
-
-            # JSON files
-            elif isinstance(kind, str) and kind.startswith("json"):
-                st.write("JSON detected → backend ingestion")
-                st.json(info)
-                override = None
-
+            st.markdown(f"#### 🧠 Detected Objects")
+            if detected_labels:
+                st.write(", ".join(detected_labels))
             else:
-                override = st.text_input("Folder", suggested, key=f"ov{i}")
+                st.caption("None detected")
 
-            processed.append({"tmp_path": tmp_path, "filename": up.name, "override": override})
+            st.markdown(f"#### 🗂️ Categories")
+            if mapped_categories:
+                cat_display = [f"`{main}/{sub}/{sp}`" for main, sub, sp in mapped_categories]
+                st.markdown("  •  ".join(cat_display))
+            else:
+                st.caption("Uncategorized")
 
-# --------------------------------------------------------------
-# Process Pasted JSON
-# --------------------------------------------------------------
-if json_text:
-    try:
-        parsed = json.loads(json_text)
-        json_batch_parsed = parsed
+            # Determine if human mapping is ambiguous for this file
+            # Ambiguous if any mapping has main == "Human" and specific in ("Person", "Unknown")
+            ambiguous_humans = []
+            for idx, (m, s, sp) in enumerate(mapped_categories):
+                if m == "Human" and (sp.lower() in ("person", "unknown")):
+                    ambiguous_humans.append((idx, m, s, sp))
 
-        # Send to backend for ingestion + analysis
-        json_batch_info = analyze_path(None, batch_json=parsed)
+            # If enabled and ambiguous humans present, present a selector to resolve
+            user_gender_choice = None
+            if show_gender_resolve and ambiguous_humans:
+                # show a per-file selector; using keys unique per file
+                choice = st.selectbox(
+                    label="Ambiguous human detected — resolve gender for saving",
+                    options=["Auto", "Male", "Female", "Skip"],
+                    index=0,
+                    key=f"gender_resolve_{i}"
+                )
+                user_gender_choice = choice  # "Auto", "Male", "Female", "Skip"
+                st.caption("If you choose Male/Female the file will be saved under Human/<Sub>/Male (or Female). 'Skip' will not save to ambiguous human categories.")
+            else:
+                # no UI; default Auto
+                user_gender_choice = "Auto"
 
-        st.subheader("JSON Analysis — Simplified View")
+            # Save single file (button)
+            save_btn_key = f"save_{i}"
+            if st.button(f"💾 Save {uploaded_file.name}", key=save_btn_key, use_container_width=True):
+                saved_any = False
+                saved_paths = set()  # dedupe same destination path
 
-        # ---- Decision Summary ----
-        st.markdown("### 📌 Decision Summary")
-        dec = json_batch_info.get("decision_summary", {}) if isinstance(json_batch_info, dict) else {}
-        if dec:
-            for col, d in dec.items():
-                st.markdown(f"- **{col}** → `{str(d).upper()}`")
+                # Build an adjusted mapping list honoring manual gender choice
+                adjusted_mappings = []
+                for (m, s, sp) in mapped_categories:
+                    # handle ambiguous humans
+                    if m == "Human" and (sp.lower() in ("person", "unknown")):
+                        if user_gender_choice == "Male":
+                            adjusted_mappings.append((m, s, "Male"))
+                        elif user_gender_choice == "Female":
+                            adjusted_mappings.append((m, s, "Female"))
+                        elif user_gender_choice == "Skip":
+                            # skip adding this human mapping
+                            continue
+                        else:  # Auto
+                            adjusted_mappings.append((m, s, sp))
+                    else:
+                        adjusted_mappings.append((m, s, sp))
+
+                # Save to each (distinct) folder path
+                for main, sub, sp in adjusted_mappings:
+                    specific_safe = sp if sp and sp != "Unknown" else None
+
+                    # Build destination folder (NO per-file subfolder)
+                    if specific_safe:
+                        folder_path = os.path.join(save_root, main, sub, specific_safe)
+                    else:
+                        folder_path = os.path.join(save_root, main, sub)
+
+                    os.makedirs(folder_path, exist_ok=True)
+                    dst = os.path.join(folder_path, uploaded_file.name)
+
+                    # dedupe same destination
+                    if dst not in saved_paths:
+                        shutil.copy(tmp_path, dst)
+                        saved_paths.add(dst)
+                        saved_any = True
+
+                if saved_any:
+                    st.success(f"✅ Saved {uploaded_file.name}")
+                else:
+                    st.warning(f"⚠️ No category saved for {uploaded_file.name} (you may have chosen Skip or nothing was detected).")
+
+                # Log CSV once per file with adjusted mappings (deduped)
+                if log_csv:
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                    detected_str = ";".join(detected_labels) if detected_labels else ""
+                    # dedupe textual mapped categories as strings
+                    mapped_strs = []
+                    for m, s, sp in adjusted_mappings:
+                        mapped_strs.append(f"{m}/{s}/{sp}")
+                    mapped_strs = list(dict.fromkeys(mapped_strs))  # preserve order + dedupe
+                    mapped_str = ";".join(mapped_strs) if mapped_strs else "Uncategorized"
+                    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([timestamp, uploaded_file.name, detected_str, mapped_str])
+
+        processed_data.append({
+            "path": tmp_path,
+            "filename": uploaded_file.name,
+            "detected_labels": detected_labels,
+            "mapped_categories": mapped_categories
+        })
+
+    # Bulk save (Save All) area
+    st.markdown("---")
+    if st.button("💾 Save ALL processed files", use_container_width=True):
+        total_saved = 0
+        total_files_saved = 0
+
+        for j, data in enumerate(processed_data):
+            tmp_path = data["path"]
+            fname = data["filename"]
+            detected_labels = data["detected_labels"]
+            original_mappings = data["mapped_categories"]
+
+            # For bulk save, we need to check if there are ambiguous humans and — if the UI was enabled — pick per-file choice
+            # If show_gender_resolve is enabled and ambiguous exists, read the selectbox state (same key used above)
+            if show_gender_resolve:
+                # If at least one ambiguous human was present earlier, the selectbox exists; else key may not exist
+                key = f"gender_resolve_{j}"
+                try:
+                    user_choice = st.session_state.get(key, "Auto")
+                except Exception:
+                    user_choice = "Auto"
+            else:
+                user_choice = "Auto"
+
+            # Build adjusted mappings honoring user_choice for ambiguous humans
+            adjusted_mappings = []
+            for (m, s, sp) in original_mappings:
+                if m == "Human" and (sp.lower() in ("person", "unknown")):
+                    if user_choice == "Male":
+                        adjusted_mappings.append((m, s, "Male"))
+                    elif user_choice == "Female":
+                        adjusted_mappings.append((m, s, "Female"))
+                    elif user_choice == "Skip":
+                        continue
+                    else:
+                        adjusted_mappings.append((m, s, sp))
+                else:
+                    adjusted_mappings.append((m, s, sp))
+
+            saved_paths = set()
+            saved_this_file = False
+
+            for main, sub, sp in adjusted_mappings:
+                specific_safe = sp if sp and sp != "Unknown" else None
+
+                if specific_safe:
+                    folder_path = os.path.join(save_root, main, sub, specific_safe)
+                else:
+                    folder_path = os.path.join(save_root, main, sub)
+
+                os.makedirs(folder_path, exist_ok=True)
+                dst = os.path.join(folder_path, fname)
+
+                if dst not in saved_paths:
+                    shutil.copy(tmp_path, dst)
+                    saved_paths.add(dst)
+                    total_saved += 1
+                    saved_this_file = True
+
+            if saved_this_file:
+                total_files_saved += 1
+
+            # Log CSV once per file (deduped mappings)
+            if log_csv:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                detected_str = ";".join(detected_labels) if detected_labels else ""
+                mapped_strs = [f"{m}/{s}/{sp}" for m, s, sp in adjusted_mappings]
+                mapped_strs = list(dict.fromkeys(mapped_strs))
+                mapped_str = ";".join(mapped_strs) if mapped_strs else "Uncategorized"
+                with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([timestamp, fname, detected_str, mapped_str])
+
+        if total_saved > 0:
+            st.success(f"✅ Saved {total_saved} file-copies across categories (affecting {total_files_saved} files).")
+            st.balloons()
         else:
-            st.markdown("_No decisions available_")
+            st.warning("⚠️ No files were saved (no categories detected or user skipped ambiguous humans).")
 
-        # ---- Structure Overview (ASCII Tree) ----
-        st.markdown("### 🗂️ Structure Overview")
-        diag = json_batch_info.get("diagnostics", {}) if isinstance(json_batch_info, dict) else {}
-
-        for col, d in diag.items():
-            st.markdown(f"#### ◼️ {col}")
-            n = d.get("n", 0)
-            keys = d.get("n_keys", 0)
-            nesting = d.get("nesting", False)
-
-            tree = (
-                f"{col}/\n"
-                f"├── rows: {n}\n"
-                f"├── keys: {keys}\n"
-                f"└── nested: {nesting}"
-            )
-
-            st.code(tree)
-
-        # Raw diagnostics expandable
-        st.markdown("### 📘 Raw Diagnostics (Optional)")
-        with st.expander("Show full JSON diagnostics"):
-            st.json(json_batch_info)
-
-    except Exception as e:
-        st.error(f"Invalid JSON: {e}")
-
-# --------------------------------------------------------------
-# SAVE ALL BUTTON
-# --------------------------------------------------------------
-st.write("---")
-if (processed or json_batch_parsed) and st.button("Save All"):
-    results = []
-    progress = st.progress(0)
-    stat = st.empty()
-
-    total = len(processed) + (1 if json_batch_parsed else 0)
-    idx = 0
-
-    # Save normal files
-    for item in processed:
-        idx += 1
-        stat.write(f"Saving {item['filename']}...")
-        override = item.get("override")
-
-        try:
-            dest = save_item(item["tmp_path"], custom_folder=override) if override else save_item(item["tmp_path"])
-            results.append(dest)
-        except Exception as e:
-            st.error(f"Save failed: {e}")
-
-        progress.progress(idx / total)
-
-    # Save JSON batch
-    if json_batch_parsed:
-        idx += 1
-        stat.write("Saving JSON batch...")
-        res = ingest_json_batch(json_batch_parsed)
-        results.append(res)
-        progress.progress(idx / total)
-
-        st.subheader("JSON Ingestion Result — Summary")
-
-        artifacts = res.get("artifacts", {}) if isinstance(res, dict) else {}
-
-        if artifacts.get("db_path"):
-            st.markdown(f"- **SQLite DB created:** `{artifacts['db_path']}`")
-        if artifacts.get("saved_files"):
-            st.markdown(f"- **NoSQL files saved:** {len(artifacts['saved_files'])}")
-        if artifacts.get("schema_files"):
-            st.markdown(f"- **Schema files:** {len(artifacts['schema_files'])}")
-
-    stat.write("Done!")
-    st.success("All saved successfully.")
-    st.subheader("Saved Outputs")
-    st.write(results)
-
-st.write("---")
-st.caption("CortexVault — Clean, Error-Free Streamlit UI")
+# --------------------------------------
+# Footer
+# --------------------------------------
+st.divider()
+st.caption("💡 Built with Streamlit, YOLOv8, and EfficientNetV2-M — © 2025 Team Zenith")
