@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+# Optional / recommended for organizer_backend features:
+pillow
+opencv-python-headless
+torch
+torchvision
+ultralytics
