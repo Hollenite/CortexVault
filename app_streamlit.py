@@ -7,8 +7,16 @@ import json
 import cv2
 from pathlib import Path
 
-# Backend (includes ML helpers)
-from organizer_backend import analyze_path, save_item, ORGANIZED_ROOT, ingest_json_batch, load_models, analyze_image
+# Backend (includes ML helpers + hybrid query)
+from organizer_backend import (
+    analyze_path,
+    save_item,
+    ORGANIZED_ROOT,
+    ingest_json_batch,
+    load_models,
+    analyze_image,
+    hybrid_query,
+)
 
 # --------------------------------------------------------------
 # Streamlit Page Setup
@@ -251,6 +259,123 @@ if (processed or json_batch_parsed) and st.button("Save All"):
     st.success("All saved successfully.")
     st.subheader("Saved Outputs")
     st.write(results)
+
+# --------------------------------------------------------------
+# GLOBAL QUERY: SQL + JSON + IMAGES (Hybrid)
+# --------------------------------------------------------------
+st.write("---")
+st.subheader("🔎 Global Query — SQL + JSON + Images")
+
+if "query_page" not in st.session_state:
+    st.session_state["query_page"] = 1
+
+if "query_text" not in st.session_state:
+    st.session_state["query_text"] = ""
+
+query_input = st.text_input(
+    "Enter SQL (SELECT ...) or keyword / filter (e.g. `age > 25`, `India`, `user = 10`)",
+    value=st.session_state["query_text"],
+)
+
+c1, c2, c3 = st.columns([1, 1, 1])
+with c1:
+    run_btn = st.button("Run Query")
+with c2:
+    prev_btn = st.button("Prev Page (SQL)", disabled=st.session_state["query_page"] <= 1)
+with c3:
+    next_btn = st.button("Next Page (SQL)")
+
+if run_btn:
+    st.session_state["query_text"] = query_input
+    st.session_state["query_page"] = 1
+elif prev_btn:
+    st.session_state["query_page"] = max(1, st.session_state["query_page"] - 1)
+elif next_btn:
+    st.session_state["query_page"] = st.session_state["query_page"] + 1
+
+active_query = st.session_state["query_text"].strip()
+
+if active_query:
+    try:
+        result = hybrid_query(
+            active_query,
+            page=st.session_state["query_page"],
+            page_size=100,
+        )
+    except Exception as e:
+        st.error(f"Query failed: {e}")
+        result = None
+
+    if result:
+        if result.get("error"):
+            st.error(result["error"])
+        else:
+            mode = result.get("mode")
+
+            # ---------------- SQL MODE (SELECT ...)
+            if mode == "sql":
+                st.markdown("### 🟢 SQL Query Results")
+                st.caption(
+                    f"Page {result.get('page', 1)} • Page size {result.get('page_size', 100)}"
+                )
+
+                db_results = result.get("db_results", [])
+                if not db_results:
+                    st.info("No SQLite databases found in `output/JSON/SQL`.")
+                else:
+                    for db_entry in db_results:
+                        st.markdown(f"#### DB: `{db_entry.get('db_path', '')}`")
+                        if db_entry.get("error"):
+                            st.error(db_entry["error"])
+                            continue
+
+                        total_rows = db_entry.get("total_rows", 0)
+                        st.caption(f"Total rows: {total_rows}")
+
+                        rows = db_entry.get("rows", [])
+                        if rows:
+                            st.dataframe(rows, use_container_width=True)
+                        else:
+                            st.write("No rows on this page.")
+
+            # ---------------- TEXT / FILTER MODE (JSON + SQL keyword + images)
+            else:
+                st.markdown("### 🟡 JSON Results")
+                json_res = result.get("json_results", {})
+                jmatches = json_res.get("matches", []) if isinstance(json_res, dict) else []
+                st.caption(
+                    f"Matches: {len(jmatches)} • Files scanned: {json_res.get('total_files_scanned', 0)}"
+                )
+
+                max_json_show = min(50, len(jmatches))
+                for m in jmatches[:max_json_show]:
+                    title = f"{m.get('file', '')} [index {m.get('index', 0)}]"
+                    with st.expander(title):
+                        st.json(m.get("object", {}))
+
+                st.markdown("### 🟣 SQL Keyword Matches (Simple Scan)")
+                sql_kw = result.get("sql_keyword_results", {})
+                dbs = sql_kw.get("dbs", []) if isinstance(sql_kw, dict) else []
+                if not dbs:
+                    st.caption("No SQL keyword matches.")
+                else:
+                    for db_entry in dbs:
+                        st.markdown(f"#### DB: `{db_entry.get('db_path', '')}`")
+                        for t in db_entry.get("tables", []):
+                            st.markdown(f"**Table:** `{t.get('table', '')}`")
+                            rows = t.get("rows", [])
+                            if rows:
+                                st.dataframe(rows, use_container_width=True)
+                            else:
+                                st.caption("No rows matched in this table.")
+
+                st.markdown("### 🔵 Image Path Matches")
+                img_res = result.get("image_results", {})
+                imgs = img_res.get("matches", []) if isinstance(img_res, dict) else []
+                st.caption(f"Image matches: {len(imgs)}")
+                max_imgs_show = min(50, len(imgs))
+                for p in imgs[:max_imgs_show]:
+                    st.write(p)
 
 st.write("---")
 st.caption("CortexVault — Clean, Error-Free Streamlit UI")

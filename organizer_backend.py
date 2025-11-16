@@ -1,5 +1,5 @@
 """
-Merged organizer_backend — JSON ingestion + SQL/NoSQL decision + image analysis + AI-only image saving
+Merged organizer_backend — JSON ingestion + SQL/NoSQL decision + image analysis + AI-only image saving + hybrid query
 
 Behaviors:
 - JSON ingestion & SQL/NoSQL decisioning (rich diagnostics) preserved.
@@ -7,12 +7,18 @@ Behaviors:
   Example: output/Human/Adults/Male/img.jpg
 - If ML libs unavailable or model loading fails, images fallback to output/Images/.
 - Videos/documents saved as before (organized under folders like Videos, Documents/<ext>).
+- NEW: Hybrid query engine for everything in output:
+    - SQL: run SELECT queries across all .sqlite DBs (paginated)
+    - JSON: filter or keyword search across all JSON files
+    - Images: name/category substring search
 """
 
 import os
 import json
 import sqlite3
 import shutil
+import re
+from glob import glob
 from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime
 
@@ -349,6 +355,7 @@ def ingest_json_batch_advanced(batch: Any, target_root: Optional[str] = None) ->
 
     return result
 
+
 def ingest_json_batch(batch: Any, target_root: Optional[str] = None) -> Dict:
     return ingest_json_batch_advanced(batch, target_root)
 
@@ -360,7 +367,7 @@ def analyze_path(path: Optional[str], batch_json=None):
     If path is json file -> parse & ingest
     Otherwise detect file type (image/video/document)
     """
-    import os, json
+    import os as _os, json as _json
     if batch_json is not None:
         return ingest_json_batch(batch_json)
 
@@ -371,10 +378,10 @@ def analyze_path(path: Optional[str], batch_json=None):
 
     if ext == "json":
         try:
-            parsed = json.load(open(path, "r"))
+            parsed = _json.load(open(path, "r"))
             return {
                 "type": "json-file-ingested",
-                "preview": json.dumps(parsed, indent=2)[:800],
+                "preview": _json.dumps(parsed, indent=2)[:800],
                 "ingest_result": ingest_json_batch(parsed)
             }
         except Exception as e:
@@ -671,6 +678,308 @@ def save_item(path: str, custom_folder: Optional[str] = None):
         dest = os.path.join(dest_dir, f"{name}_{now_ts()}{ce}")
     shutil.copy2(path, dest)
     return dest
+
+# ------------------------------------------------------------------
+# HYBRID QUERY ENGINE (SQL + JSON + IMAGE PATHS)
+# ------------------------------------------------------------------
+
+def _list_sqlite_dbs() -> List[str]:
+    ensure(SQL_DIR)
+    pattern = os.path.join(SQL_DIR, "*.sqlite")
+    return sorted(glob(pattern))
+
+
+def _walk_json_files() -> List[str]:
+    roots = []
+    if os.path.isdir(NOSQL_DIR):
+        roots.append(NOSQL_DIR)
+    if os.path.isdir(SQL_DIR):
+        roots.append(SQL_DIR)
+    if os.path.isdir(JSON_BASE):
+        roots.append(JSON_BASE)
+
+    seen = set()
+    json_files: List[str] = []
+    for root in roots:
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                if fn.lower().endswith(".json"):
+                    full = os.path.join(dirpath, fn)
+                    if full not in seen:
+                        seen.add(full)
+                        json_files.append(full)
+    return json_files
+
+
+def parse_simple_filter(expr: str) -> Optional[Tuple[str, str, Any]]:
+    """
+    Parse expressions like:
+      age > 25
+      score >= 10
+      country = "India"
+      user_id: 123
+    Returns (field, op, value) or None if not a filter.
+    """
+    ops = ["<=", ">=", "!=", ">", "<", "=", ":"]
+    for op in ops:
+        if op in expr:
+            left, right = expr.split(op, 1)
+            field = left.strip()
+            raw_val = right.strip().strip('"').strip("'")
+            if not field:
+                return None
+
+            # Try numeric conversion
+            if re.fullmatch(r"-?\d+\.\d+", raw_val):
+                val: Any = float(raw_val)
+            elif re.fullmatch(r"-?\d+", raw_val):
+                val = int(raw_val)
+            else:
+                val = raw_val
+            return field, op, val
+    return None
+
+
+def _compare(a: Any, op: str, b: Any) -> bool:
+    try:
+        # numeric vs numeric
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            av = a
+            bv = b
+        else:
+            av = str(a)
+            bv = str(b)
+    except Exception:
+        av = str(a)
+        bv = str(b)
+
+    if op in ("=", ":"):
+        return av == bv
+    if op == "!=":
+        return av != bv
+    if op == ">":
+        return av > bv
+    if op == "<":
+        return av < bv
+    if op == ">=":
+        return av >= bv
+    if op == "<=":
+        return av <= bv
+    return False
+
+
+def json_query(raw_query: str) -> Dict:
+    """
+    If raw_query can be parsed as simple filter -> apply field comparison.
+    Otherwise -> substring match against JSON text.
+    """
+    files = _walk_json_files()
+    matches: List[Dict[str, Any]] = []
+    q_lower = raw_query.lower()
+    filt = parse_simple_filter(raw_query)
+
+    for fp in files:
+        try:
+            with open(fp, "r", errors="ignore") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = [data]
+        else:
+            continue
+
+        for idx, obj in enumerate(items):
+            if not isinstance(obj, dict):
+                continue
+
+            ok = False
+            if filt:
+                field, op, val = filt
+                if field in obj:
+                    ok = _compare(obj[field], op, val)
+            else:
+                try:
+                    txt = json.dumps(obj, default=str).lower()
+                except Exception:
+                    txt = str(obj).lower()
+                ok = q_lower in txt
+
+            if ok:
+                matches.append({
+                    "file": fp,
+                    "index": idx,
+                    "object": obj
+                })
+
+    return {
+        "type": "json",
+        "query": raw_query,
+        "is_filter": bool(filt),
+        "matches": matches,
+        "total_files_scanned": len(files)
+    }
+
+
+def keyword_search_sql(keyword: str, limit_per_table: int = 50) -> Dict:
+    """
+    Simple keyword search across all tables in all SQLite DBs.
+    For each table, casts all columns to TEXT and applies LIKE.
+    """
+    dbs_info: List[Dict[str, Any]] = []
+    kw = f"%{keyword}%"
+
+    for db in _list_sqlite_dbs():
+        db_entry = {"db_path": db, "tables": []}
+        try:
+            conn = sqlite3.connect(db)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            table_names = [row[0] for row in cur.fetchall()]
+
+            for tname in table_names:
+                try:
+                    cur.execute(f'PRAGMA table_info("{tname}")')
+                    cols_info = cur.fetchall()
+                    cols = [c[1] for c in cols_info]
+                    if not cols:
+                        continue
+                    where = " OR ".join([f'CAST("{c}" AS TEXT) LIKE ?' for c in cols])
+                    sql = f'SELECT * FROM "{tname}" WHERE {where} LIMIT ?'
+                    params = [kw] * len(cols) + [limit_per_table]
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                    if not rows:
+                        continue
+                    colnames = [d[0] for d in cur.description] if cur.description else cols
+                    dict_rows = [dict(zip(colnames, r)) for r in rows]
+                    db_entry["tables"].append({
+                        "table": tname,
+                        "columns": colnames,
+                        "rows": dict_rows
+                    })
+                except Exception:
+                    continue
+
+            conn.close()
+        except Exception:
+            continue
+
+        if db_entry["tables"]:
+            dbs_info.append(db_entry)
+
+    return {
+        "type": "sql_keyword",
+        "keyword": keyword,
+        "dbs": dbs_info
+    }
+
+
+def search_images(keyword: str) -> Dict:
+    """
+    Search image file paths under ORGANIZED_ROOT by substring match.
+    """
+    IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
+    matches: List[str] = []
+    q = keyword.lower()
+
+    if not os.path.isdir(ORGANIZED_ROOT):
+        return {"type": "images", "keyword": keyword, "matches": []}
+
+    for dirpath, _, filenames in os.walk(ORGANIZED_ROOT):
+        for fn in filenames:
+            if fn.lower().endswith(IMAGE_EXTS):
+                full = os.path.join(dirpath, fn)
+                if q in full.lower():
+                    matches.append(full)
+
+    return {"type": "images", "keyword": keyword, "matches": matches}
+
+
+def query_sql_dbs(query: str, page: int = 1, page_size: int = 100) -> Dict:
+    """
+    Execute a SELECT query across all SQLite DBs in SQL_DIR.
+    Uses pagination: wraps query as subquery and applies LIMIT/OFFSET.
+    """
+    q_clean = query.strip().rstrip(";")
+    # Disallow multiple statements for safety
+    if ";" in q_clean:
+        return {"type": "sql", "error": "Multiple SQL statements are not allowed. Use a single SELECT query."}
+
+    db_results: List[Dict[str, Any]] = []
+
+    for db in _list_sqlite_dbs():
+        entry = {
+            "db_path": db,
+            "rows": [],
+            "columns": [],
+            "total_rows": 0,
+            "error": None
+        }
+        try:
+            conn = sqlite3.connect(db)
+            cur = conn.cursor()
+
+            # Count total rows
+            count_sql = f"SELECT COUNT(*) FROM ({q_clean}) AS sub"
+            cur.execute(count_sql)
+            total = cur.fetchone()[0] or 0
+            entry["total_rows"] = int(total)
+
+            offset = max(0, (page - 1) * page_size)
+            data_sql = f"SELECT * FROM ({q_clean}) AS sub LIMIT ? OFFSET ?"
+            cur.execute(data_sql, (page_size, offset))
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description] if cur.description else []
+            entry["columns"] = cols
+            entry["rows"] = [dict(zip(cols, r)) for r in rows]
+
+            conn.close()
+        except Exception as e:
+            entry["error"] = str(e)
+
+        db_results.append(entry)
+
+    return {
+        "type": "sql",
+        "query": query,
+        "page": page,
+        "page_size": page_size,
+        "db_results": db_results
+    }
+
+
+def hybrid_query(raw_query: str, page: int = 1, page_size: int = 100) -> Dict:
+    """
+    Main entry point for Streamlit:
+    - If query starts with SELECT -> run SQL query with pagination
+    - Else -> JSON search + simple SQL keyword search + image path search
+    """
+    q = (raw_query or "").strip()
+    if not q:
+        return {"error": "Empty query"}
+
+    if q.lower().startswith("select"):
+        sql_res = query_sql_dbs(q, page=page, page_size=page_size)
+        if "error" in sql_res:
+            return {"mode": "sql", **sql_res}
+        return {"mode": "sql", **sql_res}
+
+    # Non-SQL mode: JSON + SQL keyword + images
+    json_res = json_query(q)
+    sql_kw_res = keyword_search_sql(q)
+    img_res = search_images(q)
+
+    return {
+        "mode": "filter" if json_res.get("is_filter") else "text",
+        "raw_query": q,
+        "json_results": json_res,
+        "sql_keyword_results": sql_kw_res,
+        "image_results": img_res
+    }
 
 # ---------------- simple test runner ----------------
 if __name__ == "__main__":
